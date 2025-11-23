@@ -2,23 +2,23 @@
 C++17 Keyword-driven snippet generator — persistent custom keywords with parameters,
 help shows C++ standard keywords, and lightweight optimizations.
 
-Changes/additions (preserve existing behavior):
- 1) Custom keywords now support meaningful parameters. When defining a custom
-    keyword you may specify parameters in the form: name=default,another=42
-    The stored snippet may use placeholders {name} which will be replaced
-    with the prompted values when generating the program.
- 2) The :help command now shows the list of C++17 standard keywords.
- 3) Minor performance-conscious changes: passing large containers by const-ref,
-    avoiding unnecessary copies, and small allocations reserved where appropriate.
+Changes/additions from original provided source:
+ 1) All (previously unmapped) standard C++17 keywords now have small, meaningful
+    handlers so the follow-up prompts provide constructive, illustrative questions.
+    The handlers are intentionally lightweight and preserve the original program
+    flow and behavior.
+ 2) During processing of an input line, if a token looks like an undefined custom
+    keyword (i.e. it's not a C++17 keyword and not previously stored), the tool
+    pauses and asks the user whether to define it now or skip it. If the user
+    chooses to define it, a small define flow runs (parameters + snippet) and the
+    new custom keyword is saved and used immediately for the continuing processing.
 
-Other behavior/features unchanged:
- - Sequence-aware detection of every keyword occurrence.
- - Follow-up prompts reference each occurrence by index and token position.
- - read_multiline_body(...) implemented (reads until a single '.' line).
- - EOF during any follow-up prompts aborts and exits cleanly.
- - User commands :add/:define, :list, :remove, :help retained and extended.
+Other behavior/features unchanged: sequence-aware detection of every keyword
+occurrence, follow-up prompts reference each occurrence, read_multiline_body(...)
+implemented, EOF during follow-ups aborts cleanly, commands :add/:define, :list,
+:remove, :help retained and extended.
 
-Compile: g++ -std=c++17 -O2 -Wall -Wextra -o snippet_gen snippet_gen.cpp
+Compile: g++ -std=c++17 -O2 -Wall -Wextra -o snippet_gen snippet_gen_updated.cpp
 */
 
 #include <algorithm>
@@ -156,7 +156,7 @@ static const unordered_set<string>& cpp17_keywords() {
             "wchar_t","while","xor","xor_eq"
         };
         unordered_set<string> s;
-        s.reserve(128);
+        s.reserve(256);
         for (auto p : arr) s.insert(string(p));
         return s;
     }();
@@ -319,7 +319,7 @@ static Parts parts_from_user_snippet_with_params(const UserKeyword &uk, const ma
         const string &pname = pp.first;
         auto it = values.find(pname);
         string val = (it != values.end()) ? it->second : pp.second;
-        // replace occurrences of "{pname}" with val
+        // replace occurrences of "{" + pname + "}" with val
         replace_all(transformed, "{" + pname + "}", val);
     }
     // Now place transformed into parts
@@ -630,8 +630,8 @@ static Parts handle_cast(Context &ctx, const string &castkw, const string &tag) 
         p.body.push_back("cout << v << endl;");
         return p;
     } else if (castkw == "dynamic_cast") {
-        p.top.push_back("struct Base { virtual ~Base() = default; };");
-        p.top.push_back("struct Derived : Base { int x = 42; };");
+        p.top.push_back("struct Base { virtual ~Base() = default; }; ");
+        p.top.push_back("struct Derived : Base { int x = 42; }; ");
         p.body.push_back("// (" + tag + ") Demonstrate dynamic_cast");
         p.body.push_back("Base* b = new Derived();");
         p.body.push_back("if (Derived* d = dynamic_cast<Derived*>(b)) {");
@@ -733,7 +733,7 @@ static Parts handle_static_assert(Context &ctx, const string &tag) {
 
 static Parts handle_alignas_alignof(Context &ctx, const string &tag) {
     Parts p;
-    p.top.push_back("struct alignas(32) Aligned { char data[64]; };");
+    p.top.push_back("struct alignas(32) Aligned { char data[64]; }; ");
     p.body.push_back("// (" + tag + ") Demonstrate alignas/alignof");
     p.body.push_back("Aligned a;");
     p.body.push_back("cout << \"alignof(Aligned) = \" << alignof(Aligned) << endl;");
@@ -753,7 +753,7 @@ static Parts handle_thread_local(Context &ctx, const string &tag) {
 static Parts handle_mutable(Context &ctx, const string &tag) {
     Parts p;
     string member = ask("[" + tag + "] Mutable member name", "cached");
-    p.top.push_back("struct S { mutable int " + member + " = 0; int value = 0; int get() const { return " + member + " = value; } };");
+    p.top.push_back("struct S { mutable int " + member + " = 0; int value = 0; int get() const { return " + member + " = value; } }; ");
     p.body.push_back("// (" + tag + ") Demonstrate mutable");
     p.body.push_back("S s{0, 7};");
     p.body.push_back("cout << \"get() = \" << s.get() << endl;");
@@ -802,6 +802,283 @@ static Parts handle_generic_with_body(Context &ctx, const string &kw, const stri
     return p;
 }
 
+// -------------------- Additional handlers for previously unmapped keywords --------------------
+
+static Parts handle_extern(Context &ctx, const string &tag) {
+    Parts p;
+    string decl = ask("[" + tag + "] Declaration to treat as 'extern' (e.g. int x)", "int external_value");
+    p.top.push_back("extern " + decl + ";");
+    p.body.push_back("// (" + tag + ") Demonstrate extern declaration above; at runtime we just note it.");
+    p.body.push_back("cout << \"extern declaration inserted: \" << \"" + decl + "\" << endl;");
+    return p;
+}
+
+static Parts handle_inline(Context &ctx, const string &tag) {
+    Parts p;
+    string sig = ask("[" + tag + "] Inline function signature (without body)", "int foo()");
+    string body = ask("[" + tag + "] Inline function body single statement", "return 42;");
+    p.top.push_back("inline " + sig + " { " + body + " }");
+    p.body.push_back("// (" + tag + ") Demonstrate inline function above and call it:");
+    // attempt to derive a function name
+    string fname = sig;
+    size_t pos = fname.find('(');
+    if (pos != string::npos) fname = fname.substr(0, pos);
+    size_t sp = fname.find_last_of(' ');
+    if (sp != string::npos) fname = fname.substr(sp+1);
+    p.body.push_back("cout << " + fname + "() << endl;");
+    return p;
+}
+
+static Parts handle_register(Context &ctx, const string &tag) {
+    Parts p;
+    string decl = ask("[" + tag + "] Variable declaration using 'register' (e.g. int i = 0)", "int i = 0");
+    p.body.push_back("// (" + tag + ") Demonstrate register (historical, may be ignored by modern compilers)");
+    p.body.push_back("register " + decl + ";");
+    // record variable if possible
+    std::istringstream iss(decl);
+    string t, n;
+    if (iss >> t >> n) {
+        size_t eq = n.find('=');
+        string varname = (eq==string::npos) ? n : n.substr(0, eq);
+        varname = normalize_token(varname);
+        if (!varname.empty()) { ctx.vars[varname] = t; ctx.last_var = varname; }
+    }
+    p.body.push_back("cout << \"register var processed.\" << endl;");
+    return p;
+}
+
+static Parts handle_asm(Context &ctx, const string &tag) {
+    Parts p;
+    string code = ask("[" + tag + "] Inline assembly snippet (single string)", "\"nop\"");
+    p.body.push_back("// (" + tag + ") Demonstrate asm (platform dependent; illustrative)");
+    p.body.push_back("asm(" + code + ");");
+    p.body.push_back("cout << \"Inserted asm snippet.\" << endl;");
+    return p;
+}
+
+static Parts handle_goto(Context &ctx, const string &tag) {
+    Parts p;
+    string label = ask("[" + tag + "] Label name to create/jump to", "L1");
+    p.body.push_back("// (" + tag + ") Demonstrate goto (use sparingly)");
+    p.body.push_back(label + ": ;");
+    p.body.push_back("goto " + label + ";");
+    p.body.push_back("cout << \"Performed goto to label " + label + "\" << endl;");
+    return p;
+}
+
+static Parts handle_break_continue(Context &ctx, const string &kw, const string &tag) {
+    Parts p;
+    string count = ask("[" + tag + "] Loop iterations to demonstrate", "5");
+    p.body.push_back("// (" + tag + ") Demonstrate " + kw + " inside a loop");
+    p.body.push_back("for (int i = 0; i < " + count + "; ++i) {");
+    if (kw == "break") {
+        p.body.push_back("    if (i == 2) break;");
+        p.body.push_back("    cout << i << endl;");
+    } else {
+        p.body.push_back("    if (i == 2) { cout << \"continue at i=2\" << endl; continue; }");
+        p.body.push_back("    cout << i << endl;");
+    }
+    p.body.push_back("}");
+    return p;
+}
+
+static Parts handle_export(Context &ctx, const string &tag) {
+    Parts p;
+    p.body.push_back("// (" + tag + ") 'export' keyword is largely historical in header/module contexts; illustrative only");
+    p.body.push_back("cout << \"export (illustrative)\" << endl;");
+    return p;
+}
+
+// -------------------- New handlers for requested standard keywords --------------------
+
+static Parts handle_const(Context &ctx, const string &tag) {
+    Parts p;
+    string type = ask("[" + tag + "] Type for const variable", "int");
+    string name = ask("[" + tag + "] Name for const variable", "kValue");
+    string val = ask("[" + tag + "] Initial value for " + name, "100");
+    p.body.push_back("// (" + tag + ") Declare and use a meaningful const variable");
+    p.body.push_back("const " + type + " " + name + " = " + val + ";");
+    p.body.push_back("cout << \"" + name + " = \" << " + name + " << endl;");
+    return p;
+}
+
+static Parts handle_decltype(Context &ctx, const string &tag) {
+    Parts p;
+    string expr = ask("[" + tag + "] An expression to inspect with decltype", "42");
+    string name = ask("[" + tag + "] Variable name to declare with decltype", "y");
+    p.body.push_back("// (" + tag + ") Use decltype to deduce the type of an expression and declare a variable");
+    p.body.push_back("decltype(" + expr + ") " + name + " = " + expr + ";");
+    p.body.push_back("cout << \"declared var '" + name + "' = \" << " + name + " << endl;");
+    return p;
+}
+
+static Parts handle_explicit(Context &ctx, const string &tag) {
+    Parts p;
+    string cls = ask("[" + tag + "] Class name to create with explicit constructor", "Number");
+    p.top.push_back("struct " + cls + " { int v; explicit " + cls + "(int x):v(x){} int get() const { return v; } }; ");
+    p.body.push_back("// (" + tag + ") Use explicit constructor to avoid implicit conversions; construct explicitly");
+    p.body.push_back(cls + " n(" + ask("[" + tag + "] Constructor argument for " + cls, "7") + ");");
+    p.body.push_back("cout << \"" + cls + "::get() = \" << n.get() << endl;");
+    return p;
+}
+
+static Parts handle_bool_literal(Context &ctx, const string &kw, const string &tag) {
+    Parts p;
+    string name = ask("[" + tag + "] Name for bool variable", "flag");
+    string val = (kw == "true") ? "true" : "false";
+    p.body.push_back("// (" + tag + ") Demonstrate boolean literal '" + val + "' stored and checked meaningfully");
+    p.body.push_back("bool " + name + " = " + val + ";");
+    p.body.push_back("if (" + name + ") cout << \"" + name + " is true\" << endl; else cout << \"" + name + " is false\" << endl;");
+    return p;
+}
+
+static Parts handle_friend(Context &ctx, const string &tag) {
+    Parts p;
+    string cls = ask("[" + tag + "] Class name to create with a friend accessor", "Box");
+    p.top.push_back("struct " + cls + " { private: int secret = 99; public: friend int reveal(const " + cls + "& b); };");
+    p.top.push_back("int reveal(const " + cls + "& b) { return b.secret; }");
+    p.body.push_back("// (" + tag + ") Use friend function to access private member meaningfully");
+    p.body.push_back(cls + " b;" );
+    p.body.push_back("cout << \"friend reveal = \" << reveal(b) << endl;");
+    return p;
+}
+
+static Parts handle_namespace(Context &ctx, const string &tag) {
+    Parts p;
+    string ns = ask("[" + tag + "] Namespace name to create", "myns");
+    string fname = ask("[" + tag + "] Function name inside namespace", "answer");
+    string ret = ask("[" + tag + "] Integer result the function should return", "123");
+    std::ostringstream ss;
+    ss << "namespace " << ns << " { int " << fname << "() { return " << ret << "; } }";
+    p.top.push_back(ss.str());
+    p.body.push_back("// (" + tag + ") Call a namespaced function and use its result meaningfully");
+    p.body.push_back("cout << \"namespace::function() = \" << " + ns + "::" + fname + "() << endl;");
+    return p;
+}
+
+static Parts handle_noexcept(Context &ctx, const string &tag) {
+    Parts p;
+    string fname = ask("[" + tag + "] Name for noexcept function", "safe_func");
+    string ret = ask("[" + tag + "] Integer value to return from function", "7");
+    p.top.push_back("int " + fname + "() noexcept { return " + ret + "; }");
+    p.body.push_back("// (" + tag + ") Call noexcept function and use result");
+    p.body.push_back("cout << \"noexcept result = \" << " + fname + "() << endl;");
+    return p;
+}
+
+static Parts handle_nullptr(Context &ctx, const string &tag) {
+    Parts p;
+    string type = ask("[" + tag + "] Pointer type to demonstrate (e.g. int)", "int");
+    p.body.push_back("// (" + tag + ") Demonstrate nullptr usage and safe check before dereference");
+    p.body.push_back(type + "* p = nullptr;");
+    p.body.push_back("if (p == nullptr) { cout << \"pointer is nullptr, allocating and assigning\" << endl; p = new " + type + "(42); cout << *p << endl; delete p; } else cout << *p << endl;");
+    return p;
+}
+
+static Parts handle_access_specifiers(Context &ctx, const string &kw, const string &tag) {
+    Parts p;
+    string cls = ask("[" + tag + "] Class name to create", "C");
+    std::ostringstream def;
+    def << "struct " << cls << " {\n"
+        << "private:\n"
+        << "    int priv = 1;\n"
+        << "protected:\n"
+        << "    int prot = 2;\n"
+        << "public:\n"
+        << "    int pub = 3;\n"
+        << "    int get_priv() const { return priv; }\n"
+        << "    int get_prot() const { return prot; }\n"
+        << "};";
+    p.top.push_back(def.str());
+    p.body.push_back("// (" + tag + ") Use accessors to read private/protected/public members meaningfully");
+    p.body.push_back(cls + " o;");
+    // Single valid C++ statement string
+    p.body.push_back("cout << \"pub=\" << o.pub << \", priv=\" << o.get_priv() << \", prot=\" << o.get_prot() << endl;");
+    return p;
+}
+
+static Parts handle_static(Context &ctx, const string &tag) {
+    Parts p;
+    string fname = ask("[" + tag + "] Function name to hold a static counter", "counter_func");
+    p.top.push_back("int " + fname + "() { static int cnt = 0; return ++cnt; }");
+    p.body.push_back("// (" + tag + ") Demonstrate static local lifetime across calls");
+    p.body.push_back("cout << \"call1=\" << " + fname + "() << \", call2=\" << " + fname + "() << endl;");
+    return p;
+}
+
+static Parts handle_this(Context &ctx, const string &tag) {
+    Parts p;
+    string cls = ask("[" + tag + "] Class name to create that uses this", "Thing");
+    p.top.push_back("struct " + cls + " { int v = 0; void set(int x) { this->v = x; } int get() const { return v; } }; ");
+    p.body.push_back("// (" + tag + ") Use this-> to refer to members inside methods and show effect");
+    p.body.push_back(cls + " t; t.set(" + ask("[" + tag + "] Value to set via this->", "9") + ");");
+    p.body.push_back("cout << \"this-> set value = \" << t.get() << endl;");
+    return p;
+}
+
+static Parts handle_typedef_typename(Context &ctx, const string &kw, const string &tag) {
+    Parts p;
+    if (kw == "typedef") {
+        string orig = ask("[" + tag + "] Original type to alias", "long");
+        string alias = ask("[" + tag + "] Alias name", "LInt");
+        p.top.push_back("typedef " + orig + " " + alias + ";");
+        p.body.push_back("// (" + tag + ") Use typedef alias to declare a variable meaningfully");
+        p.body.push_back(alias + " v = 123456789L; cout << v << endl;");
+    } else {
+        string tparam = ask("[" + tag + "] Template parameter type to use with typename (e.g. T)", "T");
+        std::ostringstream def;
+        def << "template <typename " << tparam << ">\nstruct Holder { " << tparam << " value; Holder(" << tparam << " v):value(v){} };";
+        p.top.push_back(def.str());
+        p.body.push_back("// (" + tag + ") Use typename in a template context: instantiate Holder<int>");
+        p.body.push_back("Holder<int> h(5); cout << h.value << endl;");
+    }
+    return p;
+}
+
+static Parts handle_using(Context &ctx, const string &tag) {
+    Parts p;
+    string kind = ask("[" + tag + "] 'alias' or 'directive'?", "alias");
+    if (kind == "directive") {
+        string ns = ask("[" + tag + "] Namespace to bring in (e.g. std)", "std");
+        p.body.push_back("// (" + tag + ") Demonstrate using-directive (note: program already uses namespace std globally)");
+        p.body.push_back("cout << \"using directive for namespace " + ns + " noted.\" << endl;");
+    } else {
+        string orig = ask("[" + tag + "] Original type to alias (e.g. std::string)", "std::string");
+        string alias = ask("[" + tag + "] Alias name", "Str");
+        p.top.push_back("using " + alias + " = " + orig + ";");
+        p.body.push_back("// (" + tag + ") Use alias in main meaningfully");
+        p.body.push_back(alias + " s = \"hi\"; cout << s << endl;");
+    }
+    return p;
+}
+
+static Parts handle_virtual(Context &ctx, const string &tag) {
+    Parts p;
+    p.top.push_back("struct BaseV { virtual ~BaseV() = default; virtual int id() const { return 1; } }; ");
+    p.top.push_back("struct DerivedV : BaseV { int id() const override { return 2; } }; ");
+    p.body.push_back("// (" + tag + ") Demonstrate virtual dispatch via base pointer to derived instance");
+    p.body.push_back("BaseV* b = new DerivedV(); cout << \"virtual id=\" << b->id() << endl; delete b;");
+    return p;
+}
+
+static Parts handle_void(Context &ctx, const string &tag) {
+    Parts p;
+    string fname = ask("[" + tag + "] Function name that returns void", "doit");
+    string stmt = ask("[" + tag + "] Statement inside the void function (single)", "cout << \"did it\" << endl;");
+    p.top.push_back("void " + fname + "() { " + stmt + " }");
+    p.body.push_back("// (" + tag + ") Call void function for its side-effect");
+    p.body.push_back(fname + "();");
+    return p;
+}
+
+static Parts handle_volatile(Context &ctx, const string &tag) {
+    Parts p;
+    string type = ask("[" + tag + "] Type to declare volatile variable (e.g. int)", "int");
+    p.body.push_back("// (" + tag + ") Demonstrate volatile qualification for a variable that may change externally");
+    p.body.push_back("volatile " + type + " v = 0; cout << \"volatile v initial=\" << v << endl; v = 1; cout << \"volatile v after change=\" << v << endl;");
+    return p;
+}
+
 // -------------------- Dispatcher per occurrence, updated to support user keywords with params ------
 
 static Parts generate_parts_for_keyword_occurrence(const string &kw,
@@ -828,7 +1105,7 @@ static Parts generate_parts_for_keyword_occurrence(const string &kw,
         return parts_from_user_snippet_with_params(uk, values, tag);
     }
 
-    // built-in keyword routing (unchanged)
+    // built-in keyword routing (unchanged + additional handlers)
     if (kw == "int" || kw == "double" || kw == "float" || kw == "char" ||
         kw == "long" || kw == "short" || kw == "signed" || kw == "unsigned" ||
         kw == "bool" || kw == "wchar_t" || kw == "char16_t" || kw == "char32_t")
@@ -856,6 +1133,34 @@ static Parts generate_parts_for_keyword_occurrence(const string &kw,
     if (kw == "sizeof" || kw == "typeid") return handle_sizeof_typeid(ctx, tag);
     if (kw == "and" || kw == "or" || kw == "not" || kw == "xor" || kw == "bitand" || kw == "bitor" || kw == "compl" || kw == "not_eq" || kw == "and_eq" || kw == "or_eq" || kw == "xor_eq")
         return handle_alternative_tokens(ctx, kw, tag);
+
+    // additional standard keyword handlers
+    if (kw == "extern") return handle_extern(ctx, tag);
+    if (kw == "inline") return handle_inline(ctx, tag);
+    if (kw == "register") return handle_register(ctx, tag);
+    if (kw == "asm") return handle_asm(ctx, tag);
+    if (kw == "goto") return handle_goto(ctx, tag);
+    if (kw == "break" || kw == "continue") return handle_break_continue(ctx, kw, tag);
+    if (kw == "export") return handle_export(ctx, tag);
+
+    // newly added keyword handlers
+    if (kw == "const") return handle_const(ctx, tag);
+    if (kw == "decltype") return handle_decltype(ctx, tag);
+    if (kw == "explicit") return handle_explicit(ctx, tag);
+    if (kw == "true" || kw == "false") return handle_bool_literal(ctx, kw, tag);
+    if (kw == "friend") return handle_friend(ctx, tag);
+    if (kw == "namespace") return handle_namespace(ctx, tag);
+    if (kw == "noexcept") return handle_noexcept(ctx, tag);
+    if (kw == "nullptr") return handle_nullptr(ctx, tag);
+    if (kw == "private" || kw == "protected" || kw == "public") return handle_access_specifiers(ctx, kw, tag);
+    if (kw == "static") return handle_static(ctx, tag);
+    if (kw == "this") return handle_this(ctx, tag);
+    if (kw == "typedef" || kw == "typename") return handle_typedef_typename(ctx, kw, tag);
+    if (kw == "using") return handle_using(ctx, tag);
+    if (kw == "virtual") return handle_virtual(ctx, tag);
+    if (kw == "void") return handle_void(ctx, tag);
+    if (kw == "volatile") return handle_volatile(ctx, tag);
+
     // fallback
     return handle_generic_with_body(ctx, kw, tag);
 }
@@ -1013,8 +1318,64 @@ int main() {
             return 0;
         }
 
-        // tokenize input and capture every occurrence in order (including custom keywords)
+        // tokenize input and offer to define any unknown tokens that look like custom keywords
         vector<string> tokens = tokenize(trimmed);
+        try {
+            for (size_t i = 0; i < tokens.size(); ++i) {
+                string raw = tokens[i];
+                string norm = normalize_token(raw);
+                if (norm.empty()) continue;
+                // if it's not a standard keyword and not already a stored user keyword,
+                // and it looks like an identifier (starts with alpha or '_'), offer to define or skip
+                if (cpp17_keywords().find(norm) == cpp17_keywords().end() && user_keywords.find(norm) == user_keywords.end()) {
+                    // check identifier-like
+                    if ((std::isalpha(static_cast<unsigned char>(norm[0])) || norm[0] == '_')) {
+                        string choice = ask("Token '" + norm + "' is not a C++17 or stored custom keyword. Define it now? (y to define / s to skip)", "s");
+                        if (choice == "y" || choice == "Y") {
+                            // run a tiny define flow that mirrors :add for this single keyword
+                            string name = norm; // use the normalized token as the name
+                            if (kwset.find(name) != kwset.end()) {
+                                cout << "That name conflicts with a built-in C++17 keyword. Skipping.\n";
+                                continue;
+                            }
+                            // parameters
+                            string params_line = ask("Provide parameters (format: name=default,other=val) or leave blank", "");
+                            vector<std::pair<string,string>> params;
+                            if (!params_line.empty()) {
+                                auto parts = split_csv(params_line);
+                                for (auto &p : parts) {
+                                    size_t eq = p.find('=');
+                                    string pname = trim((eq==string::npos)?p:p.substr(0,eq));
+                                    string pdef = trim((eq==string::npos)?"":p.substr(eq+1));
+                                    if (!pname.empty()) params.emplace_back(pname, pdef);
+                                }
+                            }
+                            cout << "Paste the snippet that demonstrates this custom keyword. You may use placeholders {name}.\n";
+                            vector<string> snippet_lines = read_multiline_body("End with a single '.' line:");
+                            std::ostringstream ss;
+                            for (auto &l : snippet_lines) ss << l << "\n";
+                            UserKeyword uk;
+                            uk.snippet = ss.str();
+                            uk.params = params;
+                            user_keywords[name] = std::move(uk);
+                            if (save_user_keywords(user_keywords)) {
+                                cout << "Custom keyword '" << name << "' saved to disk with " << user_keywords[name].params.size() << " parameter(s).\n";
+                            } else {
+                                cout << "Failed to save custom keywords to disk.\n";
+                            }
+                        } else {
+                            // skip this token silently
+                            cout << "Skipping token '" << norm << "'.\n";
+                        }
+                    }
+                }
+            }
+        } catch (const EOFExit&) {
+            cout << "\nEOF received during custom-keyword definition prompt. Cancelling and exiting.\n";
+            return 0;
+        }
+
+        // now build occurrences (includes newly-defined user keywords)
         vector<std::pair<string,int>> occurrences;
         occurrences.reserve(tokens.size());
         for (size_t i = 0; i < tokens.size(); ++i) {
