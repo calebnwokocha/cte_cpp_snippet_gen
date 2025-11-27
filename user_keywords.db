@@ -1,3 +1,15 @@
+===KEYWORD:how===
+cout << "This is how" << endl;
+===END===
+===KEYWORD:keyword===
+cout << "Good job!" << endl;
+===END===
+===KEYWORD:to===
+cout << "to use the" << endl;
+===END===
+===KEYWORD:use===
+cout << "keyword" << endl;
+===END===
 ===KEYWORD:word===
 ===PARAMS:string====
 // {string}
