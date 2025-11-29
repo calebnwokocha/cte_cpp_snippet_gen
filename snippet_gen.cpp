@@ -1,5 +1,5 @@
 /*
-C++17 Keyword-driven snippet generator — persistent custom keywords with parameters,
+C++17 Keyword-driven snippet generator â€” persistent custom keywords with parameters,
 help shows C++ standard keywords, and lightweight optimizations.
 
 Changes/additions from original provided source:
@@ -35,6 +35,8 @@ Compile: g++ -std=c++17 -O2 -Wall -Wextra -o snippet_gen snippet_gen_updated.cpp
 #include <typeinfo>
 #include <unordered_set>
 #include <vector>
+#include <thread>
+#include <chrono>
 
 using std::cin;
 using std::cout;
@@ -164,6 +166,76 @@ static vector<string> read_multiline_body(const string &instruction = "Enter lin
         lines.push_back(line);
     }
     return lines;
+}
+
+// streambuf that forwards to an underlying buffer but adds a tiny delay per character.
+// It also implements xsputn by forwarding character-by-character to ensure the delay
+// is applied to bulk writes as well.
+class SlowBuf : public std::streambuf {
+    std::streambuf* orig_;
+    unsigned int ms_per_char_;
+public:
+    SlowBuf(std::streambuf* orig, unsigned int ms_per_char = 6)
+        : orig_(orig), ms_per_char_(ms_per_char) {}
+
+protected:
+    // replace SlowBuf::overflow with this
+    virtual int_type overflow(int_type ch) override {
+        if (ch == traits_type::eof()) return traits_type::not_eof(ch);
+        char c = static_cast<char>(ch);
+
+        // write the char to the original buffer
+        if (orig_->sputc(c) == traits_type::eof()) return traits_type::eof();
+
+        // force the underlying buffer to flush so the terminal displays the char immediately
+        orig_->pubsync();
+
+        // avoid long delay on newline to keep interactivity reasonable
+        if (c != '\n') std::this_thread::sleep_for(std::chrono::milliseconds(ms_per_char_));
+        return ch;
+    }
+
+    // replace SlowBuf::xsputn with this
+    virtual std::streamsize xsputn(const char* s, std::streamsize n) override {
+        // forward one-by-one to overflow so each character is flushed and delayed
+        for (std::streamsize i = 0; i < n; ++i) {
+            if (overflow(static_cast<unsigned char>(s[i])) == traits_type::eof())
+                return i;
+        }
+        return n;
+    }
+    // forward sync/flush to underlying buffer
+    virtual int sync() override {
+        return orig_->pubsync();
+    }
+};
+
+// global pointers to allow install/uninstall
+static SlowBuf *g_slow_cout = nullptr;
+static SlowBuf *g_slow_cerr = nullptr;
+static std::streambuf* g_old_cout = nullptr;
+static std::streambuf* g_old_cerr = nullptr;
+
+// call once at program start to enable slow character-by-character output.
+// ms_per_char: milliseconds per non-newline character (6ms â‰ˆ ChatGPT feel; adjust as desired).
+static void install_slow_output(unsigned int ms_per_char = 6) {
+    if (g_slow_cout) return; // already installed
+    g_old_cout = std::cout.rdbuf();
+    g_old_cerr = std::cerr.rdbuf();
+    g_slow_cout = new SlowBuf(g_old_cout, ms_per_char);
+    g_slow_cerr = new SlowBuf(g_old_cerr, ms_per_char);
+    std::cout.rdbuf(g_slow_cout);
+    std::cerr.rdbuf(g_slow_cerr);
+}
+
+// optional: restore original buffers (call at exit if you want to be tidy)
+static void restore_output() {
+    if (g_old_cout) std::cout.rdbuf(g_old_cout);
+    if (g_old_cerr) std::cerr.rdbuf(g_old_cerr);
+    delete g_slow_cout;
+    delete g_slow_cerr;
+    g_slow_cout = g_slow_cerr = nullptr;
+    g_old_cout = g_old_cerr = nullptr;
 }
 
 // -------------------- C++17 keyword set (function-local static) --------------------
@@ -1236,9 +1308,10 @@ int main() {
     std::ios::sync_with_stdio(false);
     cin.tie(nullptr);
 
-    cout << "C++17 Keyword-driven snippet generator — sequence-aware with parameterized custom keywords\n";
+    install_slow_output(10); // <-- enable character-by-character printing (10 ms per char)
+    cout << "C++17 Keyword-driven snippet generator. Sequence-aware with parameterized custom keywords.\n";
     cout << "Enter a line containing C++17 keywords (duplicates allowed). The tool\n";
-    cout << "will ask follow-up questions for every occurrence in order and then\n";
+    cout << "will ask follow-up questions for every keyword occurrence in order and then\n";
     cout << "produce a single integrated C++17 program.\n\n";
     cout << "Commands:\n";
     cout << "  :add / :define         - define a new custom keyword with parameters\n";
