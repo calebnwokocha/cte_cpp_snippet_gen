@@ -592,13 +592,47 @@ static Parts handle_do(Context &ctx, const string &tag) {
 static Parts handle_switch(Context &ctx, const string &tag) {
     Parts p;
     string init = ask("[" + tag + "] Initializer (e.g., int n = 2)", "int n = 2");
-    string expr = ask("[" + tag + "] Expression to switch on", "n");
+    // try to register variable from initializer (like other handlers do)
+    {
+        std::istringstream iss(init);
+        string t, n;
+        if (iss >> t >> n) {
+            size_t eqpos = n.find('=');
+            string varname = (eqpos==string::npos) ? n : n.substr(0, eqpos);
+            varname = normalize_token(varname);
+            if (!varname.empty()) { ctx.vars[varname] = t; ctx.last_var = varname; }
+        }
+    }
+
+    string expr = ask("[" + tag + "] Expression to switch on", ctx.last_var.empty() ? "n" : ctx.last_var);
     string cases = ask("[" + tag + "] Comma-separated case values", "1,2,3");
     vector<string> case_list = split_csv(cases);
+
     p.body.push_back("// (" + tag + ") Demonstrate switch");
     p.body.push_back(init + ";");
     p.body.push_back("switch (" + expr + ") {");
-    for (auto &c : case_list) p.body.push_back("    case " + c + ": cout << \"case " + c + "\" << endl; break;");
+
+    for (auto &c : case_list) {
+        // prompt for either a single-line or multiline body for this case
+        string single = ask("[" + tag + "] Single-line for case " + c + " (enter 'm' for multiline)", "cout << \"case " + c + "\" << endl; break;");
+        if (single == "m" || single == "M") {
+            // multiline mode
+            p.body.push_back("    case " + c + ":");
+            vector<string> lines = read_multiline_body("Enter lines for case " + c + " (finish with a single '.' on its own line):");
+            bool has_break = false;
+            for (auto &ln : lines) {
+                string tln = trim(ln);
+                p.body.push_back("        " + ln);
+                // simple detection of break; or return; to avoid appending an extra break
+                if (tln == "break;" || tln.rfind("break", 0) == 0 || tln.find("return ") == 0 || tln == "return;") has_break = true;
+            }
+            if (!has_break) p.body.push_back("        break;");
+        } else {
+            // single-line case: place the user's line directly (assume they include terminating ';' or break)
+            p.body.push_back("    case " + c + ": " + single);
+        }
+    }
+
     p.body.push_back("    default: cout << \"default\" << endl; break;");
     p.body.push_back("}");
     return p;
@@ -859,10 +893,117 @@ static Parts handle_static_assert(Context &ctx, const string &tag) {
 
 static Parts handle_alignas_alignof(Context &ctx, const string &tag) {
     Parts p;
-    p.top.push_back("struct alignas(32) Aligned { char data[64]; }; ");
-    p.body.push_back("// (" + tag + ") Demonstrate alignas/alignof");
-    p.body.push_back("Aligned a;");
-    p.body.push_back("cout << \"alignof(Aligned) = \" << alignof(Aligned) << endl;");
+
+    // Questions
+    string struct_name = ask("[" + tag + "] Struct name", "Demo");
+    string struct_align_s = ask("[" + tag + "] Struct alignment in bytes (positive integer)", "16");
+    string fields_s = ask("[" + tag + "] Number of fields in struct", "5");
+
+    // parse numeric answers safely
+    int struct_align = 16;
+    int nfields = 5;
+    try { struct_align = std::stoi(struct_align_s); if (struct_align <= 0) struct_align = 16; } catch(...) {}
+    try { nfields = std::stoi(fields_s); if (nfields < 0) nfields = 0; } catch(...) {}
+
+    // typical sizes (x86_64 conventions)
+    auto typical_size = [](const string &t)->int {
+        if (t == "char") return 1;
+        if (t == "short") return 2;
+        if (t == "int") return 4;
+        if (t == "long") return 8;
+        if (t == "long long") return 8;
+        if (t == "float") return 4;
+        if (t == "double") return 8;
+        if (t == "bool") return 1;
+        // fallback: unknown types — use 0 to indicate unknown
+        return 0;
+    };
+
+    // collect fields
+    struct Field { string type; string name; int length; string align; };
+    vector<Field> fields;
+    for (int i = 0; i < nfields; ++i) {
+        string idx = std::to_string(i+1);
+        string typ = ask("[" + tag + "] Field #" + idx + " type", (i==0 ? "int" : (i==1 ? "int" : (i==2 ? "short" : (i==3 ? "char" : "char")))));
+        string name = ask("[" + tag + "] Field #" + idx + " name", "var" + idx);
+        string len_s = ask("[" + tag + "] Field #" + idx + " array length (0 = not an array)", "0");
+        int len = 0;
+        try { len = std::stoi(len_s); if (len < 0) len = 0; } catch(...) {}
+        string falign = ask("[" + tag + "] Field #" + idx + " alignment in bytes (empty = none)", "");
+        // normalize common synonyms
+        if (typ == "signed char") typ = "char";
+        if (typ == "unsigned char") typ = "char";
+        fields.push_back({typ, name, len, falign});
+    }
+
+    // register last variable name in context for consistency with other handlers
+    if (!fields.empty()) { ctx.vars[fields[0].name] = struct_name; ctx.last_var = fields[0].name; }
+
+    // Build struct declaration lines (multi-line, commented)
+    p.top.push_back(std::string("struct alignas(") + std::to_string(struct_align) + ") " + struct_name);
+    p.top.push_back("{");
+
+    for (auto &f : fields) {
+        // declaration
+        std::string decl = "    ";
+        if (!f.align.empty()) decl += "alignas(" + f.align + ") ";
+        decl += f.type + " " + f.name;
+        if (f.length > 0) decl += "[" + std::to_string(f.length) + "]";
+        decl += ";";
+
+        // comment with typical size and alignment note (if provided)
+        int tsize = typical_size(f.type);
+        std::string comment;
+        if (tsize > 0) {
+            comment = " // " + std::to_string(tsize) + " bytes";
+            if (f.length > 0) comment += " x " + std::to_string(f.length) + " elements";
+        } else {
+            comment = " // size: platform-dependent";
+            if (f.length > 0) comment += " x " + std::to_string(f.length) + " elements";
+        }
+        if (!f.align.empty()) comment += "; aligned to " + f.align + " bytes";
+
+        p.top.push_back(decl + comment);
+    }
+
+    p.top.push_back("");
+    p.top.push_back("    // example: an aligned sub-object (member) with explicit alignment");
+    // Optionally (nothing here) — we already allowed per-field alignas above.
+    p.top.push_back("};");
+
+    // Body: demonstration code
+    // instance name
+    string inst_name = ask("[" + tag + "] Instance name to create", "d");
+    ctx.vars[inst_name] = struct_name;
+    ctx.last_var = inst_name;
+
+    p.body.push_back("// (" + tag + ") Demonstrate alignas/alignof for " + struct_name);
+    p.body.push_back(struct_name + " " + inst_name + ";");
+    p.body.push_back(std::string("cout << \"alignof(") + struct_name + ") = \" << alignof(" + struct_name + ") << endl;");
+    p.body.push_back(std::string("cout << \"sizeof(") + struct_name + ") = \" << sizeof(" + struct_name + ") << endl;");
+    p.body.push_back(std::string("cout << \"address of ") + inst_name + " = \" << (void*)&" + inst_name + " << endl;");
+    p.body.push_back(std::string("cout << \"address mod ") + std::to_string(struct_align) + " = \" << (reinterpret_cast<uintptr_t>(&" + inst_name + ") % " + std::to_string(struct_align) + ") << endl;");
+
+    // If there are array members we can also instantiate an array of structs and print element addresses
+    string arr_count_s = ask("[" + tag + "] Create an array of instances? (enter count or 0 for single instance)", "3");
+    int arr_count = 0;
+    try { arr_count = std::stoi(arr_count_s); } catch(...) { arr_count = 0; }
+    if (arr_count > 0) {
+        p.body.push_back(struct_name + " arr_" + inst_name + "[" + std::to_string(arr_count) + "];");
+        p.body.push_back(std::string("cout << \"alignof(") + struct_name + ") = \" << alignof(" + struct_name + ") << endl;");
+        p.body.push_back(std::string("cout << \"sizeof(") + struct_name + ") = \" << sizeof(" + struct_name + ") << \", elements = " + std::to_string(arr_count) + "\" << endl;");
+        for (int i = 0; i < arr_count; ++i) {
+            p.body.push_back(std::string("cout << \"&arr_") + inst_name + "[" + std::to_string(i) + "] = \" << (void*)&arr_" + inst_name + "[" + std::to_string(i) + "]"
+                                  " << \", addr mod " + std::to_string(struct_align) + " = \" << (reinterpret_cast<uintptr_t>(&arr_" + inst_name + "[" + std::to_string(i) + "]) % " + std::to_string(struct_align) + ") << endl;");
+        }
+        if (arr_count > 1) {
+            p.body.push_back(std::string("cout << \"distance between element 0 and 1 = \" << (reinterpret_cast<uintptr_t>(&arr_") + inst_name + "[1]) - reinterpret_cast<uintptr_t>(&arr_" + inst_name + "[0]) << endl;");
+        }
+    }
+
+    // final note comment in generated code (informational)
+    p.body.push_back("// Note: sizes shown in comments are typical for x86_64 and may vary by platform/ABI.");
+
     return p;
 }
 
@@ -898,16 +1039,128 @@ static Parts handle_sizeof_typeid(Context &ctx, const string &tag) {
 
 static Parts handle_alternative_tokens(Context &ctx, const string &kw, const string &tag) {
     Parts p;
+
+    // helper: check if type is integral
+    auto is_integral = [&](const string &t)->bool {
+        static const vector<string> ints = {
+            "char","signed char","unsigned char",
+            "short","unsigned short",
+            "int","unsigned int",
+            "long","unsigned long",
+            "long long","unsigned long long"
+        };
+        for (auto &s : ints) if (t == s) return true;
+        return false;
+    };
+
+    // helper: ask for name + type but enforce "integral only"
+    auto ask_integral = [&](const string &prefix, const string &def_name, const string &def_type){
+        string name = ask("[" + tag + "] " + prefix + " name", def_name);
+        string type;
+
+        while (true) {
+            type = ask("[" + tag + "] " + prefix + " type (integral only)", def_type);
+            if (is_integral(type)) break;
+            cout << "Type '" << type << "' is not integral. Allowed: int, long, short, char, unsigned..., etc.\n";
+        }
+        return std::pair<string,string>(type,name);
+    };
+
+    // boolean alternative tokens (leave unchanged)
     if (kw == "and" || kw == "or" || kw == "not") {
-        string expr_default = ctx.last_var.empty() ? "x > 0 and y > 0" : ctx.last_var + " > 0 and true";
-        string expr = ask("[" + tag + "] A simple Boolean expression (you may use alternative tokens)", expr_default);
-        p.body.push_back("// (" + tag + ") Demonstrate alternative tokens like 'and'/'or'/'not'");
+        string expr = ask("[" + tag + "] Boolean expression", "x > 0 and y > 0");
+        p.body.push_back("// (" + tag + ") Demonstrate 'and'/'or'/'not'");
         p.body.push_back("int x = 1, y = 2;");
-        p.body.push_back("if (" + expr + ") cout << \"expression true\" << endl; else cout << \"expression false\" << endl;");
-    } else {
-        p.body.push_back("// (" + tag + ") Demonstrate alternative token: " + kw);
-        p.body.push_back("cout << \"Alternative token: " + kw + "\" << endl;");
+        p.body.push_back(std::string("if (") + expr + ") cout << \"true\" << endl; else cout << \"false\" << endl;");
+        return p;
     }
+
+    // bitwise binaries: xor, bitand, bitor
+    if (kw == "xor" || kw == "bitand" || kw == "bitor") {
+
+        auto L = ask_integral("Left operand", "a", "int");
+        auto R = ask_integral("Right operand", "b", "int");
+
+        string a_type = L.first, a_name = L.second;
+        string b_type = R.first, b_name = R.second;
+
+        string a_val = ask("[" + tag + "] Left operand initial value", "5");
+        string b_val = ask("[" + tag + "] Right operand initial value", "3");
+
+        ctx.vars[a_name] = a_type;
+        ctx.last_var = a_name;
+
+        string sym = (kw=="xor" ? "^" : (kw=="bitand" ? "&" : "|"));
+
+        p.body.push_back("// (" + tag + ") Demonstrate alternative token '" + kw + "'");
+        p.body.push_back(a_type + " " + a_name + " = " + a_val + ";");
+        p.body.push_back(b_type + " " + b_name + " = " + b_val + ";");
+        p.body.push_back(std::string("cout << \"") + a_name + " " + kw + " " + b_name +
+                         " = \" << (" + a_name + " " + kw + " " + b_name + ") << endl;");
+        p.body.push_back(std::string("cout << \"") + a_name + " " + sym + " " + b_name +
+                         " (symbol) = \" << (" + a_name + " " + sym + " " + b_name + ") << endl;");
+        return p;
+    }
+
+    // unary: compl
+    if (kw == "compl") {
+        auto V = ask_integral("Variable", "x", "int");
+        string t = V.first, v = V.second;
+        string val = ask("[" + tag + "] Initial value", "42");
+
+        ctx.vars[v] = t;
+        ctx.last_var = v;
+
+        p.body.push_back("// (" + tag + ") Demonstrate 'compl'");
+        p.body.push_back(t + " " + v + " = " + val + ";");
+        p.body.push_back(std::string("cout << \"compl " + v + " = \" << (compl " + v + ") << endl;"));
+        p.body.push_back(std::string("cout << \"~" + v + " = \" << (~" + v + ") << endl;"));
+        return p;
+    }
+
+    // not_eq: inequality
+    if (kw == "not_eq") {
+        auto L = ask_integral("Left operand", "x", "int");
+        string t = L.first, left = L.second;
+
+        string right = ask("[" + tag + "] Right operand/value", "0");
+
+        p.body.push_back(t + " " + left + " = 1; // example");
+        ctx.vars[left] = t;
+        ctx.last_var = left;
+
+        p.body.push_back("// (" + tag + ") Demonstrate 'not_eq'");
+        p.body.push_back(std::string("cout << \"") + left + " not_eq " + right +
+                         " => \" << ((" + left + " not_eq " + right +
+                         ") ? \"true\" : \"false\") << endl;");
+        return p;
+    }
+
+    // compound: and_eq, or_eq, xor_eq
+    if (kw == "and_eq" || kw == "or_eq" || kw == "xor_eq") {
+        auto V = ask_integral("Variable to modify", "v", "int");
+        string t = V.first, v = V.second;
+
+        string val = ask("[" + tag + "] Initial value", "15");
+        string rhs = ask("[" + tag + "] RHS value", "6");
+
+        ctx.vars[v] = t;
+        ctx.last_var = v;
+
+        string sym = (kw=="and_eq") ? "&=" : (kw=="or_eq" ? "|=" : "^=");
+
+        p.body.push_back("// (" + tag + ") Demonstrate '" + kw + "'");
+        p.body.push_back(t + " " + v + " = " + val + ";");
+        p.body.push_back(std::string("cout << \"before: " + v + " = \" << ") + v + " << endl;");
+        p.body.push_back(v + " " + kw + " " + rhs + ";");
+        p.body.push_back(std::string("cout << \"after (" + v + " " + sym + " " + rhs +
+                         "): \" << ") + v + " << endl;");
+        return p;
+    }
+
+    // fallback
+    p.body.push_back("// (" + tag + ") Unknown alternative token");
+    p.body.push_back(std::string("cout << \"Alternative token: ") + kw + "\" << endl;");
     return p;
 }
 
@@ -1241,7 +1494,7 @@ static Parts generate_parts_for_keyword_occurrence(const string &kw,
     if (kw == "for") return handle_for(ctx, tag);
     if (kw == "while") return handle_while(ctx, tag);
     if (kw == "do") return handle_do(ctx, tag);
-    if (kw == "switch") return handle_switch(ctx, tag);
+    if (kw == "switch" || kw == "case") return handle_switch(ctx, tag);
     if (kw == "return") return handle_return(ctx, tag);
     if (kw == "class" || kw == "struct" || kw == "union") return handle_class_struct_union(ctx, kw, tag);
     if (kw == "enum") return handle_enum(ctx, tag);
