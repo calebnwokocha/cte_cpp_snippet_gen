@@ -360,13 +360,18 @@ struct Parts {
     vector<string> body;
 };
 
+struct Frame {
+    Parts parts;       // header + inner lines (header stored in parts.body[0] if present)
+    size_t insert_pos; // index in aggregated.body where inner lines should be inserted
+};
+
 struct Context {
     map<string,string> vars;
     std::set<string> types;
     string last_var;
     string last_type;
     map<string,string> meta;
-    std::vector<Parts> control_stack;
+    std::vector<Frame> control_stack;
 };
 
 // trim a string (preserve original indentation elsewhere)
@@ -390,8 +395,10 @@ static bool parts_is_opening_block(const Parts &p) {
         t = ln.substr(pos);
         if (t.rfind("for (", 0) == 0 || t.rfind("while (", 0) == 0 ||
             t.rfind("if (", 0) == 0 || t.rfind("switch (", 0) == 0 ||
-            t.rfind("do {", 0) == 0 || t.rfind("case ", 0) == 0) {
-            return true;
+            t.rfind("do {", 0) == 0 || t.rfind("case ", 0) == 0 ||
+            t.rfind("try", 0) == 0 || t.rfind("catch(", 0) == 0 ||
+            t.rfind("catch (", 0) == 0 || t.rfind("else", 0) == 0) {
+                return true;
         }
         // generic: any non-empty line that ends with '{' is a candidate
         if (!t.empty() && t.back() == '{') return true;
@@ -457,13 +464,84 @@ static void extract_block_header_and_inner(const Parts &p,
     }
 }
 
-static string declare_variable(Context &ctx, const string &type, const string &base_name, const string &init) {
-    string name = base_name;
-    int suffix = 1;
-    while (ctx.vars.find(name) != ctx.vars.end()) name = base_name + std::to_string(suffix++);
-    ctx.vars[name] = type;
-    ctx.last_var = name;
-    return type + " " + name + " = " + init + ";";
+// ----------------- Identifier helpers & improved declare_variable -----------------
+static std::string sanitize_identifier(const std::string &raw) {
+    std::string out;
+    out.reserve(raw.size());
+    for (char c : raw) {
+        if ((c >= 'a' && c <= 'z') ||
+            (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') ||
+            (c == '_')) {
+            out.push_back(c);
+        } else if (c == ' ' || c == '-' || c == '.') {
+            out.push_back('_');
+        } else {
+            // drop other characters
+        }
+    }
+    if (out.empty()) out = "v";
+    if ((out[0] >= '0' && out[0] <= '9')) out = std::string("_") + out;
+    return out;
+}
+
+/*
+ Improved declare_variable:
+  - Sanitizes the requested base name.
+  - If the sanitized name already exists in ctx.vars, repeatedly asks the user
+    for another name (showing a suggested alternative) until a unique name is provided.
+  - Registers the chosen name in ctx.vars and sets ctx.last_var.
+  - Returns the textual declaration (e.g. "int foo = 0;").
+*/
+static std::string declare_variable(Context &ctx,
+                                    const std::string &type,
+                                    const std::string &base_name,
+                                    const std::string &init = "")
+{
+    std::string base = sanitize_identifier(base_name);
+    std::string candidate = base;
+
+    if (ctx.vars.find(candidate) != ctx.vars.end()) {
+        // Build an initial suggestion
+        std::string suggestion;
+        int suffix = 1;
+        do {
+            suggestion = base + std::to_string(suffix++);
+        } while (ctx.vars.find(suggestion) != ctx.vars.end());
+
+        // Prompt user until they provide a unique identifier
+        while (true) {
+            std::string prompt = "Variable name '" + candidate + "' is already used. "
+                                 "Choose another variable name (suggestion: " + suggestion + "):";
+            std::string reply = ask(prompt, suggestion);
+            std::string sanitized = sanitize_identifier(reply);
+            if (sanitized.empty()) sanitized = suggestion;
+
+            if (ctx.vars.find(sanitized) == ctx.vars.end()) {
+                candidate = sanitized;
+                break;
+            }
+
+            // prepare a different suggestion if needed
+            // simple incremental global suggestion to avoid stuck collisions
+            static int __global_sugg = 1000;
+            while (ctx.vars.find(suggestion) != ctx.vars.end()) {
+                suggestion = base + std::to_string(__global_sugg++);
+            }
+            // loop will re-prompt
+            candidate = sanitized;
+        }
+    }
+
+    // Register and return declaration
+    ctx.vars[candidate] = type;
+    ctx.last_var = candidate;
+
+    std::string decl;
+    if (init.empty()) decl = type + " " + candidate + ";";
+    else decl = type + " " + candidate + " = " + init + ";";
+
+    return decl;
 }
 
 static void append_parts(Parts &acc, const Parts &p) {
@@ -478,67 +556,189 @@ static inline std::string trim_leading(const std::string &s) {
     return s.substr(i);
 }
 
-static inline std::string leading_ws(const std::string &s) {
-    size_t i = 0;
-    while (i < s.size() && isspace((unsigned char)s[i])) ++i;
-    return s.substr(0, i);
+/// Helper: trim trailing whitespace (CR/LF/space/tab)
+static std::string trim_trailing(const std::string &s) {
+    size_t end = s.size();
+    while (end > 0 && (s[end-1] == '\r' || s[end-1] == '\n' || s[end-1] == ' ' || s[end-1] == '\t')) --end;
+    return s.substr(0, end);
 }
 
-// Replacement: append with interactive nesting support and multi-frame probing.
-// acc: accumulating Parts (top-level output buffer)
-// p: generated Parts for a single keyword handler
-// ctx: execution context (must have control_stack field)
-// kw: the keyword that produced 'p'
+// Helper: get leading whitespace substring of a line
+static std::string leading_ws_of(const std::string &line) {
+    size_t i = 0;
+    while (i < line.size() && (line[i] == ' ' || line[i] == '\t')) ++i;
+    return line.substr(0, i);
+}
+
+// Helper: find the index of the nearest *unclosed* header line (a line whose trimmed trailing char is '{')
+// that corresponds to the position `search_from`. We scan backward and account for braces so that we find
+// the most-recent header that is still open at search_from. Returns string::npos if not found.
+static size_t find_unclosed_header_index(const Parts &acc, size_t search_from) {
+    if (acc.body.empty()) return std::string::npos;
+    size_t i = (search_from == 0 ? 0 : (search_from > acc.body.size() ? acc.body.size() : search_from));
+    int depth = 0;
+    while (i > 0) {
+        --i;
+        std::string line = trim_trailing(acc.body[i]);
+        // check if line ends with '}' or '{'
+        if (!line.empty()) {
+            char last = line.back();
+            if (last == '}') {
+                ++depth;
+                continue;
+            } else if (last == '{') {
+                if (depth == 0) {
+                    return i;
+                } else {
+                    --depth;
+                    continue;
+                }
+            }
+        }
+    }
+    return std::string::npos;
+}
+
+// Helper: produce a preview for a stored open frame: prefer the header line (if found in acc) else first non-empty stored inner line.
+static std::string preview_for_frame(const Parts &acc, const Frame &f) {
+    size_t hi = find_unclosed_header_index(acc, f.insert_pos);
+    if (hi != std::string::npos) return acc.body[hi];
+    for (const auto &ln : f.parts.body) {
+        std::string t = trim_leading(ln);
+        if (!t.empty()) return ln;
+    }
+    return std::string("(open block)");
+}
+
+
+// Replaces previous append_parts_with_nesting with corrected header-matching, previewing, indentation,
+// insert_pos bookkeeping and "try next older" flow.
 static void append_parts_with_nesting(Parts &acc, const Parts &p, Context &ctx, const std::string &kw) {
+    const std::string INDENT = std::string(4, ' ');
+
     // 1) If there are open frames, ask from most-recent to older whether to insert there.
     if (!ctx.control_stack.empty()) {
-        // iterate from most recent frame to oldest
         for (int fi = static_cast<int>(ctx.control_stack.size()) - 1; fi >= 0; --fi) {
-            const Parts &frame = ctx.control_stack[fi];
+            const Frame &frame = ctx.control_stack[fi];
+            std::string preview = preview_for_frame(acc, frame);
 
-            // find a good preview string for the frame (first non-empty line)
-            std::string preview = "(open block)";
-            for (const auto &ln : frame.body) {
-                std::string t = trim_leading(ln);
-                if (!t.empty()) { preview = ln; break; }
-            }
-
-            // prompt the user about inserting into this frame
-            std::string q = "Insert snippet for '" + kw + "' inside open block (most recent first): " + preview + " ? (y/n)";
+            std::string q = "Insert snippet for '" + kw + "' inside open block: " + preview + " ? (y/n)";
             std::string resp = ask(q, "y");
             if (!resp.empty() && (resp[0] == 'y' || resp[0] == 'Y')) {
-                // append includes/top globally (preserve original behaviour)
+                // chosen to insert into this frame
                 for (const auto &inc : p.includes) acc.includes.push_back(inc);
                 for (const auto &t : p.top) acc.top.push_back(t);
 
-                // compute indentation for insertion:
-                // prefer header indentation if available, otherwise derive from first line
-                std::string base_ws;
-                if (!frame.body.empty()) {
-                    // find header-like line index (first non-empty)
-                    size_t idx = 0;
-                    while (idx < frame.body.size() && trim_leading(frame.body[idx]).empty()) ++idx;
-                    if (idx < frame.body.size()) base_ws = leading_ws(frame.body[idx]);
-                }
-                // use 4 spaces additional indent for block body
-                std::string indent = base_ws + std::string(4, ' ');
+                // insertion position
+                size_t pos = frame.insert_pos;
+                if (pos > acc.body.size()) pos = acc.body.size();
 
-                // append p.body into the chosen frame, normalizing leading whitespace
+                // find the header corresponding to this frame (robust to intervening inserted blocks)
+                size_t header_idx = find_unclosed_header_index(acc, pos);
+                std::string header_ws = (header_idx == std::string::npos) ? std::string() : leading_ws_of(acc.body[header_idx]);
+
+                // If incoming snippet is an opening control block, treat header & inner specially
+                if (parts_is_opening_block(p)) {
+                    std::vector<std::string> preceding;
+                    std::string header;
+                    std::vector<std::string> inner;
+                    bool had_closing = false;
+                    extract_block_header_and_inner(p, preceding, header, inner, had_closing);
+
+                    // Build insertion lines: preceding (at header level), header (one indent deeper than parent), initial inner (one more)
+                    std::vector<std::string> to_insert;
+                    std::string header_indent = header_ws + INDENT;
+                    std::string nested_inner_indent = header_indent + INDENT;
+
+                    for (const auto &pr : preceding) {
+                        std::string t = trim_leading(pr);
+                        if (t.empty()) to_insert.push_back(std::string());
+                        else to_insert.push_back(header_indent + t);
+                    }
+
+                    std::string header_trim = trim_leading(header);
+                    to_insert.push_back(header_indent + header_trim);
+
+                    for (const auto &ln : inner) {
+                        std::string t = trim_leading(ln);
+                        if (t.empty()) to_insert.push_back(std::string());
+                        else to_insert.push_back(nested_inner_indent + t);
+                    }
+
+                    // insert at pos
+                    acc.body.insert(acc.body.begin() + pos, to_insert.begin(), to_insert.end());
+
+                    // update insert_pos for all frames >= pos
+                    for (size_t fj = 0; fj < ctx.control_stack.size(); ++fj) {
+                        if (ctx.control_stack[fj].insert_pos >= pos) ctx.control_stack[fj].insert_pos += to_insert.size();
+                    }
+
+                    // ask whether to keep the newly-inserted block open
+                    std::string keep = ask("Detected control block header for '" + kw + "'. Keep this block open for nested inserts? (y/n)", "y");
+                    if (!keep.empty() && (keep[0] == 'y' || keep[0] == 'Y')) {
+                        // push new frame: insert_pos immediately after header + initial inner lines
+                        Frame nf;
+                        nf.parts.body.clear(); // initial inner already inserted
+                        nf.insert_pos = pos + 1 + inner.size();
+                        ctx.control_stack.push_back(std::move(nf));
+                        return;
+                    } else {
+                        // not keeping open -> ensure closing brace present aligned with header_indent
+                        size_t close_pos = pos + 1 + inner.size();
+                        if (!had_closing) {
+                            if (close_pos > acc.body.size()) close_pos = acc.body.size();
+                            bool has_closing = false;
+                            if (close_pos < acc.body.size()) {
+                                std::string t = trim_leading(acc.body[close_pos]);
+                                if (!t.empty() && t == "}") has_closing = true;
+                            }
+                            if (!has_closing) {
+                                acc.body.insert(acc.body.begin() + close_pos, header_indent + "}");
+                                for (size_t fj = 0; fj < ctx.control_stack.size(); ++fj) {
+                                    if (ctx.control_stack[fj].insert_pos >= close_pos) ctx.control_stack[fj].insert_pos += 1;
+                                }
+                            }
+                        }
+                        return;
+                    }
+                } // end opening-block handling
+
+                // Non-opening snippet: indent relative to the header_ws
+                std::string insert_indent = header_ws + INDENT;
+                std::vector<std::string> to_insert;
                 for (const auto &ln : p.body) {
-                    std::string normalized = trim_leading(ln);
-                    // preserve empty lines as empty (no inserted indent)
-                    if (normalized.empty()) ctx.control_stack[fi].body.push_back("");
-                    else ctx.control_stack[fi].body.push_back(indent + normalized);
+                    std::string t = trim_leading(ln);
+                    if (t.empty()) to_insert.push_back(std::string());
+                    else to_insert.push_back(insert_indent + t);
                 }
 
-                return; // inserted — done
+                // Insert and update bookkeeping
+                acc.body.insert(acc.body.begin() + pos, to_insert.begin(), to_insert.end());
+                // update this frame's insert_pos
+                ctx.control_stack[fi].insert_pos += to_insert.size();
+                // bump other frames' insert_pos if necessary
+                for (size_t fj = 0; fj < ctx.control_stack.size(); ++fj) {
+                    if (fj == static_cast<size_t>(fi)) continue;
+                    if (ctx.control_stack[fj].insert_pos >= pos) ctx.control_stack[fj].insert_pos += to_insert.size();
+                }
+                return;
+            } // end if user accepted this frame
+
+            // user declined this frame -> ask whether to try the next older open frame
+            if (fi > 0) {
+                std::string try_next = ask("Try the next older open block? (y/n)", "y");
+                if (try_next.empty() || (try_next[0] != 'y' && try_next[0] != 'Y')) {
+                    break; // stop trying older frames and fall through to top-level handling
+                } else {
+                    continue; // try next older
+                }
             }
-            // user declined this frame -> continue to next older frame
+            // no older frames: fall through
         }
-        // user declined all frames; fall through to normal behaviour
+        // fell out: no open frame chosen. Continue with top-level handling.
     }
 
-    // 2) No frame chosen (or no frames existed). Handle opening-block detection as before.
+    // 2) No frame chosen (or none existed). Handle opening-block at top-level.
     if (parts_is_opening_block(p)) {
         std::vector<std::string> preceding;
         std::string header;
@@ -546,32 +746,41 @@ static void append_parts_with_nesting(Parts &acc, const Parts &p, Context &ctx, 
         bool had_closing = false;
         extract_block_header_and_inner(p, preceding, header, inner, had_closing);
 
-        // Emit includes/top and any preceding lines immediately to top-level
+        // emit includes/top and preceding lines
         for (const auto &inc : p.includes) acc.includes.push_back(inc);
         for (const auto &t : p.top) acc.top.push_back(t);
-        for (const auto &ln : preceding) acc.body.push_back(ln);
+        for (const auto &ln : preceding) acc.body.push_back(trim_leading(ln));
 
-        // Build frame (header + inner) to optionally keep open
-        Parts frame;
-        if (!header.empty()) frame.body.push_back(header);
-        for (const auto &ln : inner) frame.body.push_back(ln);
-
+        // ask whether to keep open
         std::string keep = ask("Detected control block header for '" + kw + "'. Keep this block open for nested inserts? (y/n)", "y");
         if (!keep.empty() && (keep[0] == 'y' || keep[0] == 'Y')) {
-            ctx.control_stack.push_back(std::move(frame));
+            // write header (top-level)
+            std::string header_line = trim_leading(header);
+            acc.body.push_back(header_line);
+
+            // initial inner lines indented one level
+            for (const auto &ln : inner) {
+                std::string t = trim_leading(ln);
+                if (t.empty()) acc.body.push_back(std::string());
+                else acc.body.push_back(INDENT + t);
+            }
+
+            // push frame with insert_pos after header + any initial inner
+            Frame f;
+            f.parts.body.clear();
+            f.insert_pos = acc.body.size();
+            ctx.control_stack.push_back(std::move(f));
             return;
         }
 
-        // Not keeping open: emit remainder as originally (header + inner + closing)
-        // If we already emitted preceding, emit the rest; otherwise emit full p.body
-        if (preceding.empty()) {
-            for (const auto &ln : p.body) acc.body.push_back(ln);
-        } else {
-            if (!header.empty()) acc.body.push_back(header);
-            for (const auto &ln : inner) acc.body.push_back(ln);
-            if (had_closing) acc.body.push_back("}");
-            else acc.body.push_back("}");
+        // not keeping open: emit header+inner+closing immediately
+        if (!header.empty()) acc.body.push_back(trim_leading(header));
+        for (const auto &ln : inner) {
+            std::string t = trim_leading(ln);
+            if (t.empty()) acc.body.push_back(std::string());
+            else acc.body.push_back(INDENT + t);
         }
+        if (!had_closing) acc.body.push_back(std::string("}"));
         return;
     }
 
@@ -579,27 +788,40 @@ static void append_parts_with_nesting(Parts &acc, const Parts &p, Context &ctx, 
     append_parts(acc, p);
 }
 
-// Emit all open control-stack frames into acc.body (in creation order) and clear the stack.
+
+// Replaces previous flush_control_stack: closes frames in LIFO order, aligns braces to the matching header,
+// and updates other frames' insert_pos accordingly.
 static void flush_control_stack(Parts &acc, Context &ctx) {
     if (ctx.control_stack.empty()) return;
 
-    // Emit frames in order they were opened so header/inner appear sequentially.
-    for (size_t fi = 0; fi < ctx.control_stack.size(); ++fi) {
-        Parts &frame = ctx.control_stack[fi];
+    // close frames in LIFO order
+    for (int fi = static_cast<int>(ctx.control_stack.size()) - 1; fi >= 0; --fi) {
+        Frame &frame = ctx.control_stack[fi];
+        size_t close_pos = frame.insert_pos;
+        if (close_pos > acc.body.size()) close_pos = acc.body.size();
 
-        // Append every line in the frame to top-level body
-        for (const auto &ln : frame.body) acc.body.push_back(ln);
-
-        // If the last meaningful line isn't a solitary '}', append a closing brace.
-        bool has_trailing = false;
-        for (int j = static_cast<int>(frame.body.size()) - 1; j >= 0; --j) {
-            const std::string &ln = frame.body[j];
-            std::string t = trim_copy(ln);
-            if (t.empty()) continue;
-            if (t == "}") has_trailing = true;
-            break;
+        // skip if there's already a closing brace at close_pos
+        bool already = false;
+        if (close_pos < acc.body.size()) {
+            std::string t = trim_leading(acc.body[close_pos]);
+            if (!t.empty() && t == "}") already = true;
         }
-        if (!has_trailing) acc.body.push_back("}");
+
+        if (!already) {
+            // find corresponding header and its leading whitespace
+            size_t header_idx = find_unclosed_header_index(acc, close_pos);
+            std::string header_ws;
+            if (header_idx != std::string::npos) header_ws = leading_ws_of(acc.body[header_idx]);
+            else header_ws = std::string();
+
+            // insert aligned closing brace
+            acc.body.insert(acc.body.begin() + close_pos, header_ws + "}");
+
+            // bump insert_pos of earlier frames (older) so their positions remain valid
+            for (int oj = 0; oj < fi; ++oj) {
+                if (ctx.control_stack[oj].insert_pos >= close_pos) ctx.control_stack[oj].insert_pos += 1;
+            }
+        }
     }
 
     ctx.control_stack.clear();
@@ -714,8 +936,8 @@ static Parts handle_if_else(Context &ctx, const string &tag) {
     Parts p;
     string cond_default = ctx.last_var.empty() ? "x > 0" : (ctx.last_var + " > 0");
     string cond = ask("[" + tag + "] Condition expression for if", cond_default);
-    string then_stmt = ask("[" + tag + "] Then-branch (single statement)", "cout << \"then\" << endl;");
-    string else_stmt = ask("[" + tag + "] Else-branch (single statement)", "cout << \"else\" << endl;");
+    string then_stmt = ask("[" + tag + "] Then-branch ", "cout << \"then\" << endl;");
+    string else_stmt = ask("[" + tag + "] Else-branch ", "cout << \"else\" << endl;");
     p.body.push_back("// (" + tag + ") Demonstrate if/else");
     p.body.push_back("if (" + cond + ") {");
     p.body.push_back("    " + then_stmt);
