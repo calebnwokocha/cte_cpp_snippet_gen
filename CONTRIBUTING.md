@@ -115,7 +115,6 @@ Your Pull Request should:
 
 - Your contribution will become part of the project history.
 - You will be credited through GitHub’s contribution tracking.
-- Thank you for helping improve **cte_cpp_snippet_gen**.
 
 > ### Legal Notice <!-- omit in toc -->
 > When contributing to this project, you must agree that you have authored 100% of the content, that you have the necessary rights to the content and that the content you contribute may be provided under the project licence.
