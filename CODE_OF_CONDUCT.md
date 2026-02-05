@@ -1,4 +1,4 @@
-# Code of Conduct - cte_cpp_snippet_gen
+# Code of Conduct
 
 ## Our Pledge
 
