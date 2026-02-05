@@ -28,7 +28,7 @@ Notes:
 
 ## Parameter placeholders
 
-- Inside snippets, reference parameters using `{param_name}`. When a snippet is expanded the program substitutes `{param_name}` with the supplied value or the default from `===PARAMS...===`.
+Inside snippets, reference parameters using `{param_name}`. When a snippet is expanded the program substitutes `{param_name}` with the supplied value or the default from `===PARAMS...===`.
 
 ## Recommended workflow (use the program)
 
