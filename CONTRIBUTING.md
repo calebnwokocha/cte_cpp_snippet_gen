@@ -29,7 +29,7 @@ All types of contributions are encouraged and valued. See the [Table of Contents
 ## Code of Conduct
 
 This project and everyone participating in it is governed by the
-[cte_cpp_snippet_gen Code of Conduct](https://github.com/calebnwokocha/cte_cpp_snippet_gen/blob//CODE_OF_CONDUCT.md).
+[our Code of Conduct](https://github.com/calebnwokocha/cte_cpp_snippet_gen/blob/main/CODE_OF_CONDUCT.md).
 By participating, you are expected to uphold this code. Please report unacceptable behavior
 to <cnwokocha@proton.me>.
 
