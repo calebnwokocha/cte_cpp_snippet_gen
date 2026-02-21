@@ -37,6 +37,7 @@ Compile: g++ -std=c++17 -O2 -Wall -Wextra -o snippet_gen snippet_gen_updated.cpp
 #include <vector>
 #include <thread>
 #include <chrono>
+#include <unordered_map>
 
 using std::cin;
 using std::cout;
@@ -261,8 +262,11 @@ struct UserKeyword {
     vector<std::pair<string,string>> params; // ordered list of (name, default)
 };
 
+// Use a hash-map for user keywords for O(1) average lookup
+using UserKeywordMap = std::unordered_map<std::string, UserKeyword>;
+
 // Load user keywords into out_map (key -> UserKeyword)
-static void load_user_keywords(map<string,UserKeyword> &out_map, const string &path = USER_KW_FILE) {
+static void load_user_keywords(UserKeywordMap &out_map, const string &path = USER_KW_FILE) {
     out_map.clear();
     std::ifstream ifs(path, std::ios::in);
     if (!ifs) return;
@@ -328,7 +332,7 @@ static void load_user_keywords(map<string,UserKeyword> &out_map, const string &p
 }
 
 // Save user keywords map to disk
-static bool save_user_keywords(const map<string,UserKeyword> &m, const string &path = USER_KW_FILE) {
+static bool save_user_keywords(const UserKeywordMap &m, const string &path = USER_KW_FILE) {
     std::ofstream ofs(path, std::ios::out | std::ios::trunc);
     if (!ofs) return false;
     for (const auto &kv : m) {
@@ -2080,7 +2084,7 @@ static Parts generate_parts_for_keyword_occurrence(const string &kw,
                                                    Context &ctx,
                                                    int occurrence_index,
                                                    int token_pos_in_input,
-                                                   const map<string,UserKeyword> &user_keywords) {
+                                                   const UserKeywordMap &user_keywords) {
     ostringstream t;
     t << "occurrence " << occurrence_index << " (token " << token_pos_in_input << ")";
     string tag = t.str();
@@ -2192,7 +2196,7 @@ int main() {
     cout << "Type 'exit' or send EOF to quit.\n\n";
 
     // load persisted user keywords
-    map<string,UserKeyword> user_keywords;
+    UserKeywordMap user_keywords;
     load_user_keywords(user_keywords);
 
     const auto &kwset = cpp17_keywords();
